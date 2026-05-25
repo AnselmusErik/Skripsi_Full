@@ -1,0 +1,307 @@
+package routing;
+
+import core.Connection;
+import core.Coord;
+import core.DTNHost;
+import core.Message;
+import core.Settings;
+
+/**
+ * Link Duration Estimation Router for THE ONE Simulator.
+ *
+ * Estimates link duration between two nodes based on their current positions
+ * and destination positions (from RandomWaypoint mobility model), using the
+ * analytical model from:
+ *
+ *   Wu et al., "Impact of Node Mobility on Link Duration in Multihop Mobile
+ *   Networks," IEEE Transactions on Vehicular Technology, vol. 58, no. 5,
+ *   June 2009.
+ *
+ * Estimation pipeline:
+ *   1. Compute velocity vectors V1 and V2 from current → destination positions.
+ *   2. Compute relative velocity V12 = V2 - V1.
+ *   3. Compute angle alpha between V1 and V2 via the dot product formula:
+ *          cos(alpha) = (V1 · V2) / (||V1|| * ||V2||)
+ *   4. Compute relative speed Vij using the law of cosines:
+ *          Vij = sqrt(Vi^2 + Vj^2 - 2*Vi*Vj*cos(alpha))
+ *   5. Compute active distance Dij = 2r * cos(beta),
+ *      where beta is the incident angle of the relative velocity to the
+ *      observer node's transmission range. Beta is derived from the
+ *      relative position of the two nodes:
+ *          beta = arcsin( perpendicular_distance / r )
+ *      and clamped to [0, pi/2].
+ *   6. Estimate link duration:
+ *          Tij = Dij / Vij
+ */
+public class LinkDurationEstimationRouter implements RoutingDecisionEngine {
+
+    /** Settings key for detection/transmission range (metres). */
+    public static final String DETECTION_RANGE_SETTING = "detectionRange";
+
+    /** Default detection range in metres if not specified in settings. */
+    private static final double DEFAULT_DETECTION_RANGE = 10.0;
+
+    /** Transmission / detection range of this node. */
+    private double detectionRange;
+
+    // -----------------------------------------------------------------------
+    // Constructors
+    // -----------------------------------------------------------------------
+
+    /**
+     * Creates a new router from simulation settings.
+     *
+     * @param settings THE ONE settings object
+     */
+    public LinkDurationEstimationRouter(Settings settings) {
+        if (settings.contains(DETECTION_RANGE_SETTING)) {
+            this.detectionRange = settings.getDouble(DETECTION_RANGE_SETTING);
+        } else {
+            this.detectionRange = DEFAULT_DETECTION_RANGE;
+        }
+    }
+
+    /**
+     * Copy constructor (used by replicate()).
+     *
+     * @param proto prototype router to copy from
+     */
+    public LinkDurationEstimationRouter(LinkDurationEstimationRouter proto) {
+        this.detectionRange = proto.detectionRange;
+    }
+
+    // -----------------------------------------------------------------------
+    // RoutingDecisionEngine interface
+    // -----------------------------------------------------------------------
+
+    @Override
+    public void connectionUp(DTNHost thisHost, DTNHost peer) {
+        // No action required on connection establishment.
+    }
+
+    @Override
+    public void connectionDown(DTNHost thisHost, DTNHost peer) {
+        // No action required on connection teardown.
+    }
+
+    @Override
+    public void doExchangeForNewConnection(Connection con, DTNHost peer) {
+        // No metadata exchange required for this router.
+    }
+
+    @Override
+    public boolean newMessage(Message m) {
+        // Accept all newly generated messages.
+        return true;
+    }
+
+    @Override
+    public boolean isFinalDest(Message m, DTNHost aHost) {
+        return m.getTo().equals(aHost);
+    }
+
+    @Override
+    public boolean shouldSaveReceivedMessage(Message m, DTNHost thisHost) {
+        // Save the message if this host is not the final destination.
+        return !m.getTo().equals(thisHost);
+    }
+
+    /**
+     * Forward the message if the estimated link duration to the peer is
+     * greater than zero (i.e., the link is expected to last long enough
+     * to be useful).  A more sophisticated policy could compare the
+     * estimated duration against the message TTL or a threshold.
+     */
+    @Override
+    public boolean shouldSendMessageToHost(Message m, DTNHost otherHost, DTNHost thisHost) {
+        double estimatedDuration = estimateLinkDuration(thisHost, otherHost, detectionRange);
+        return estimatedDuration > 0.0;
+    }
+
+    @Override
+    public boolean shouldDeleteSentMessage(Message m, DTNHost otherHost) {
+        // Do not delete messages after forwarding (epidemic-style replication).
+        return false;
+    }
+
+    @Override
+    public boolean shouldDeleteOldMessage(Message m, DTNHost hostReportingOld) {
+        // Do not proactively drop old messages.
+        return false;
+    }
+
+    @Override
+    public void update(DTNHost thisHost) {
+        // Stateless router — no per-tick state update needed.
+    }
+
+    @Override
+    public RoutingDecisionEngine replicate() {
+        return new LinkDurationEstimationRouter(this);
+    }
+
+    // -----------------------------------------------------------------------
+    // Link Duration Estimation (core static method)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Estimates the remaining link duration between two mobile nodes using the
+     * Wu et al. (2009) analytical model.
+     *
+     * <p>The method retrieves each node's current position and its next
+     * waypoint destination (if available via {@link DTNHost#getPath()}) to
+     * approximate the velocity vector.  The link duration is then:
+     * <pre>
+     *   T_ij = D_ij / V_ij
+     * </pre>
+     * where:
+     * <ul>
+     *   <li>{@code V_ij} = relative speed derived from the law of cosines and
+     *       the angle alpha between the two velocity vectors.</li>
+     *   <li>{@code D_ij = 2r * cos(beta)} = active distance traversed within
+     *       the transmission range, with beta derived from the perpendicular
+     *       distance between the relative-velocity line and node a.</li>
+     * </ul>
+     *
+     * @param a               first node (the "observer" node)
+     * @param b               second node
+     * @param detectionRadius transmission / detection range in metres
+     * @return estimated link duration in seconds, or {@code 0.0} if the link
+     *         cannot be established or the nodes are already separating
+     */
+    public static double estimateLinkDuration(DTNHost a, DTNHost b, double detectionRadius) {
+
+        // ----------------------------------------------------------------
+        // Step 1 – Velocity vectors from current position → next waypoint
+        // ----------------------------------------------------------------
+        Coord posA0 = a.getLocation();
+        Coord posB0 = b.getLocation();
+
+        /*
+         * Attempt to obtain each node's destination from its movement path.
+         * DTNHost.getPath() returns the current movement path; the next
+         * waypoint is Path.getNextWaypoint().  If a node has no active path
+         * (e.g. it is paused), we fall back to its current position, which
+         * produces a zero velocity vector and forces the pause-state branch.
+         */
+        Coord destA = getNextWaypoint(a);
+        Coord destB = getNextWaypoint(b);
+
+        // Velocity (Displacement: Perpindahan) vectors: V = destination - current_position
+        double v1x = destA.getX() - posA0.getX();
+        double v1y = destA.getY() - posA0.getY();
+
+        double v2x = destB.getX() - posB0.getX();
+        double v2y = destB.getY() - posB0.getY();
+
+        // Speeds (magnitudes of velocity vectors)
+        double speedA = Math.sqrt(v1x * v1x + v1y * v1y);
+        double speedB = Math.sqrt(v2x * v2x + v2y * v2y);
+
+        // ----------------------------------------------------------------
+        // Step 2 – Relative velocity V12 = V2 - V1
+        // ----------------------------------------------------------------
+        double v12x = v2x - v1x;
+        double v12y = v2y - v1y;
+        double relSpeed = Math.sqrt(v12x * v12x + v12y * v12y);
+
+        // ----------------------------------------------------------------
+        // Pause-state handling
+        // ----------------------------------------------------------------
+        // If both nodes are stationary the link duration is theoretically
+        // infinite; return a large sentinel value.
+        if (relSpeed < 1e-9) {
+            if (speedA < 1e-9 && speedB < 1e-9) {
+                return Double.MAX_VALUE; // both paused – link stays forever
+            }
+            // Relative speed is effectively zero but one node moves:
+            // treat as a very long but finite contact.
+            return detectionRadius * 2.0;
+        }
+
+        // ----------------------------------------------------------------
+        // Step 3 – Angle alpha between V1 and V2
+        // ----------------------------------------------------------------
+        double alpha;
+        if (speedA < 1e-9 || speedB < 1e-9) {
+            // One node is paused; alpha is undefined – use pi/2 (worst case)
+            alpha = Math.PI / 2.0;
+        } else {
+            double dot = v1x * v2x + v1y * v2y;
+            double cosAlpha = dot / (speedA * speedB);
+            // Clamp to [-1, 1] to guard against floating-point rounding
+            cosAlpha = Math.max(-1.0, Math.min(1.0, cosAlpha));
+            alpha = Math.acos(cosAlpha);
+        }
+
+        // ----------------------------------------------------------------
+        // Step 4 – Relative speed  Vij = sqrt(Vi^2 + Vj^2 - 2*Vi*Vj*cos(alpha))
+        //          (law of cosines in velocity space)
+        // ----------------------------------------------------------------
+        double vij = Math.sqrt(speedA * speedA + speedB * speedB - 2.0 * speedA * speedB * Math.cos(alpha));
+
+        if (vij < 1e-9) {
+            // Nodes move in lockstep; link is persistent
+            return Double.MAX_VALUE;
+        }
+
+        // ----------------------------------------------------------------
+        // Step 5 – Active distance  Dij = 2r * cos(beta)
+        //
+        // Beta is the incident angle of the relative velocity to node a's
+        // transmission-range boundary.  We compute it from the perpendicular
+        // distance between node b's relative-velocity ray and node a.
+        //
+        // Using the cross-product magnitude for the perpendicular distance:
+        //   perp = |( posB - posA ) × V12_unit|
+        //        = |(dx * v12y - dy * v12x)| / |V12|
+        //
+        // Then  sin(beta) = perp / r  →  beta = arcsin(perp / r)
+        // and   Dij = 2r * cos(beta)
+        // ----------------------------------------------------------------
+        double dx = posB0.getX() - posA0.getX();
+        double dy = posB0.getY() - posA0.getY();
+
+        double cross = Math.abs(dx * v12y - dy * v12x);
+        double perpDist = cross / relSpeed; // perpendicular distance
+
+        // If perpendicular distance exceeds r the nodes will never enter each
+        // other's transmission range along the current trajectories.
+        if (perpDist > detectionRadius) {
+            return 0.0;
+        }
+
+        double sinBeta = perpDist / detectionRadius;
+        sinBeta = Math.min(sinBeta, 1.0); // numerical safety clamp
+        double beta = Math.asin(sinBeta);
+
+        double dij = 2.0 * detectionRadius * Math.cos(beta);
+
+        // ----------------------------------------------------------------
+        // Step 6 – Link duration  Tij = Dij / Vij
+        // ----------------------------------------------------------------
+        double tij = dij / vij;
+
+        return Math.max(tij, 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper utilities
+    // -----------------------------------------------------------------------
+
+    /**
+     * Returns the next waypoint destination of a host, or its current
+     * location if it has no active path (i.e. it is paused or the path
+     * has ended).
+     *
+     * @param host the host to query
+     * @return the next waypoint {@link Coord}, never {@code null}
+     */
+    private static Coord getNextWaypoint(DTNHost host) {
+        if (host.getPath() != null && host.getPath().hasNext()) {
+            return host.getPath().getNextWaypoint();
+        }
+        // No active path → treat as stationary at current location
+        return host.getLocation();
+    }
+}

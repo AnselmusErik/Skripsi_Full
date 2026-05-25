@@ -55,6 +55,19 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
     private DTNHost getOtherHost;
     private static final int bytes = 1000;
 
+    private final Map<DTNHost, Double> lastKnownSpeed = new HashMap<>();
+    private final Map<DTNHost, double[]> lastKnownDirection = new HashMap<>();
+
+    private static Coord getNextWaypoint(DTNHost host) {
+        if (host.getPath() != null) {
+            java.util.List<Coord> coords = host.getPath().getCoords();
+            if (!coords.isEmpty()) {
+                return coords.get(coords.size() - 1);
+            }
+        }
+        return host.getLocation();
+    }
+
     /**
      * Constructor. Creates a new message router based on the settings in the
      * given Settings object.
@@ -135,18 +148,16 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
             // Perhitungan Estimate Time Duration untuk Kapasitas Knapsack
             if (!String.valueOf(getHost().toString().charAt(0)).equals("s")) { // Pengecekan apakah dia Sensor atau
                                                                                // bukan
-                int capacityOFKnapsack = 0; // Jika bukan, dilakukan proses pengiriman pesan
-
-                // Menghitung batas ETD (Estimated Time Duration) secara dinamis
-                double duration = estimateLinkDuration(getHost(), otherHost);
+                // Menghitung batas ETD (Estimated Time Duration) secara dinamis dengan LDER baru
+                double duration = LinkDurationEstimationRouter.estimateLinkDuration(
+                        getHost(), otherHost, getHost().getInterfaces().get(0).getTransmitRange(),
+                        this.lastKnownSpeed, this.lastKnownDirection);
                 double speed = getHost().getInterfaces().get(0).getTransmitSpeed();
                 
-                // Kapasitas = durasi (detik) x speed (bytes/detik) dibagi bytes (1000)
-                capacityOFKnapsack = (int) ((duration * speed) / bytes);
-
-                // Handle jika kapasitas tak terhingga karena node bergerak searah dengan kecepatan sama
-                if (capacityOFKnapsack < 0 || duration == Double.MAX_VALUE) {
-                    capacityOFKnapsack = this.getBufferSize() / bytes; 
+                int capacityOFKnapsack = (int) ((duration * speed) / bytes);
+                int maxCapacity = (int) (otherHost.getRouter().getBufferSize() / bytes);
+                if (capacityOFKnapsack > maxCapacity || capacityOFKnapsack < 0 || duration == Double.MAX_VALUE) {
+                    capacityOFKnapsack = maxCapacity;
                 }
 
                 this.retrictionPerPeer.put(otherHost, capacityOFKnapsack); // Nilai kapasitas disimpan dalam Map
@@ -208,14 +219,23 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
 
     private void updateDelayTableStat(Connection con) {
         DTNHost otherHost = con.getOtherNode(getHost());
-        EstimateKnapsackBusTJRouter_Copy otherRouter = ((EstimateKnapsackBusTJRouter_Copy) otherHost.getRouter());
+        if (!(otherHost.getRouter() instanceof EstimateKnapsackBusTJRouter_Copy)) {
+            return;
+        }
+        EstimateKnapsackBusTJRouter_Copy otherRouter = (EstimateKnapsackBusTJRouter_Copy) otherHost.getRouter();
+        if (otherRouter.getDelayTable() == null) {
+            return;
+        }
         int from = otherHost.getAddress();
 
         for (Message m : getMessageCollection()) {
             int to = m.getTo().getAddress();
             MeetingEntry entry = otherRouter.getDelayTable().getMeetingEntry(from, to);
             if (entry != null) {
-                this.delayTable.getDelayEntryByMessageId(m.getId()).setChanged(true);
+                routing.rapid.DelayEntry de = this.delayTable.getDelayEntryByMessageId(m.getId());
+                if (de != null) {
+                    de.setChanged(true);
+                }
             }
         }
     }
@@ -662,6 +682,20 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
 
     @Override
     public void update() {
+        // Cache velocity/speed and direction unit vector
+        DTNHost thisHost = getHost();
+        if (thisHost.getPath() != null) {
+            lastKnownSpeed.put(thisHost, thisHost.getPath().getSpeed());
+            Coord origin = thisHost.getLocation();
+            Coord dest = getNextWaypoint(thisHost);
+            double dx = dest.getX() - origin.getX();
+            double dy = dest.getY() - origin.getY();
+            double dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist > 1e-9) {
+                lastKnownDirection.put(thisHost, new double[]{ dx / dist, dy / dist });
+            }
+        }
+
         super.update();
         // Cek sedang transfer atau tidak
         if (isTransferring() || !canStartTransfer()) {
