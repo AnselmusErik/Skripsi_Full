@@ -30,7 +30,7 @@ import routing.community.Duration;
  *
  * @author Kalis, Universitas Sanata Dharma
  */
-public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
+public class KnapsackDP extends LinkDurationRouter {
     // timestamp for meeting a host in seconds
 
     private double timestamp;
@@ -38,8 +38,21 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
     // minimizing maximum delay)
     private Map<Integer, DTNHost> hostMapping;
 
-    private final UtilityAlgorithm ALGORITHM = UtilityAlgorithm.AVERAGE_DELAY;
+    private UtilityAlgorithm algorithm = UtilityAlgorithm.AVERAGE_DELAY;
     private static final double INFINITY = 99999;
+
+    // Prophet variables
+    public static final double P_INIT = 0.75;
+    public static final double DEFAULT_BETA = 0.25;
+    public static final double GAMMA = 0.98;
+    public static final String PROPHET_NS = "ProphetRouter";
+    public static final String SECONDS_IN_UNIT_S = "secondsInTimeUnit";
+    public static final String BETA_S = "beta";
+
+    private int secondsInTimeUnit;
+    private double beta;
+    private Map<DTNHost, Double> preds;
+    private double lastAgeUpdate;
 
     // interval to verify ongoing connections in seconds
     private static final double UTILITY_INTERAL = 100.0;
@@ -74,7 +87,7 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
      *
      * @param s The settings object
      */
-    public EstimateKnapsackBusTJRouter_Copy(Settings s) {
+    public KnapsackDP(Settings s) {
         super(s);
 
         delayTable = null;
@@ -88,6 +101,19 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
         tempMsgTerpilih = new LinkedList<Message>();
         retrictionPerPeer = new HashMap<DTNHost, Integer>();
         getOtherHost = null;
+
+        if (s.contains("utilityMode")) {
+            String modeStr = s.getSetting("utilityMode");
+            try {
+                this.algorithm = UtilityAlgorithm.valueOf(modeStr.toUpperCase());
+            } catch (IllegalArgumentException e) {
+                this.algorithm = UtilityAlgorithm.AVERAGE_DELAY;
+            }
+        } else {
+            this.algorithm = UtilityAlgorithm.AVERAGE_DELAY;
+        }
+
+        initProphet(s);
     }
 
     @Override
@@ -102,7 +128,7 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
      *
      * @param r The router prototype where setting values are copied from
      */
-    protected EstimateKnapsackBusTJRouter_Copy(EstimateKnapsackBusTJRouter_Copy r) {
+    protected KnapsackDP(KnapsackDP r) {
         super(r);
 
         delayTable = r.delayTable;
@@ -116,6 +142,11 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
         tempMsgTerpilih = r.tempMsgTerpilih;
         getOtherHost = r.getOtherHost;
         retrictionPerPeer = r.retrictionPerPeer;
+        this.algorithm = r.algorithm;
+
+        this.secondsInTimeUnit = r.secondsInTimeUnit;
+        this.beta = r.beta;
+        initPreds();
     }
 
     @Override
@@ -145,6 +176,11 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
             doHostMapping(con);
             this.delayTable.dummyUpdateConnection(con);
 
+            if (this.algorithm == UtilityAlgorithm.PROPHET) {
+                updateDeliveryPredFor(otherHost);
+                updateTransitivePreds(otherHost);
+            }
+
             // Perhitungan Estimate Time Duration untuk Kapasitas Knapsack
             if (!String.valueOf(getHost().toString().charAt(0)).equals("s")) { // Pengecekan apakah dia Sensor atau
                                                                                // bukan
@@ -152,6 +188,7 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
                 double duration = LinkDurationEstimationRouter.estimateLinkDuration(
                         getHost(), otherHost, getHost().getInterfaces().get(0).getTransmitRange(),
                         this.lastKnownSpeed, this.lastKnownDirection);
+                System.out.println("Duration: " + duration);
                 double speed = getHost().getInterfaces().get(0).getTransmitSpeed();
                 
                 int capacityOFKnapsack = (int) ((duration * speed) / bytes);
@@ -159,6 +196,7 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
                 if (capacityOFKnapsack > maxCapacity || capacityOFKnapsack < 0 || duration == Double.MAX_VALUE) {
                     capacityOFKnapsack = maxCapacity;
                 }
+
 
                 this.retrictionPerPeer.put(otherHost, capacityOFKnapsack); // Nilai kapasitas disimpan dalam Map
                                                                            // (Batasan)
@@ -208,7 +246,7 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
     private void doHostMapping(Connection con) {
         DTNHost host = getHost();
         DTNHost otherHost = con.getOtherNode(host);
-        EstimateKnapsackBusTJRouter_Copy otherRouter = ((EstimateKnapsackBusTJRouter_Copy) otherHost.getRouter());
+        KnapsackDP otherRouter = ((KnapsackDP) otherHost.getRouter());
 
         // propagate host <-> address mapping
         this.hostMapping.put(host.getAddress(), host);
@@ -219,10 +257,10 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
 
     private void updateDelayTableStat(Connection con) {
         DTNHost otherHost = con.getOtherNode(getHost());
-        if (!(otherHost.getRouter() instanceof EstimateKnapsackBusTJRouter_Copy)) {
+        if (!(otherHost.getRouter() instanceof KnapsackDP)) {
             return;
         }
-        EstimateKnapsackBusTJRouter_Copy otherRouter = (EstimateKnapsackBusTJRouter_Copy) otherHost.getRouter();
+        KnapsackDP otherRouter = (KnapsackDP) otherHost.getRouter();
         if (otherRouter.getDelayTable() == null) {
             return;
         }
@@ -242,7 +280,7 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
 
     private void synchronizeDelayTables(Connection con) {
         DTNHost otherHost = con.getOtherNode(getHost());
-        EstimateKnapsackBusTJRouter_Copy otherRouter = (EstimateKnapsackBusTJRouter_Copy) otherHost.getRouter();
+        KnapsackDP otherRouter = (KnapsackDP) otherHost.getRouter();
         DelayEntry delayEntry = null;
         DelayEntry otherDelayEntry = null;
 
@@ -299,7 +337,7 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
 
     private void synchronizeMeetingTimes(Connection con) {
         DTNHost otherHost = con.getOtherNode(getHost());
-        EstimateKnapsackBusTJRouter_Copy otherRouter = (EstimateKnapsackBusTJRouter_Copy) otherHost.getRouter();
+        KnapsackDP otherRouter = (KnapsackDP) otherHost.getRouter();
         MeetingEntry meetingEntry = null;
         MeetingEntry otherMeetingEntry = null;
 
@@ -334,7 +372,7 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
 
     private void synchronizeAckedMessageIDs(Connection con) {
         DTNHost otherHost = con.getOtherNode(getHost());
-        EstimateKnapsackBusTJRouter_Copy otherRouter = (EstimateKnapsackBusTJRouter_Copy) otherHost.getRouter();
+        KnapsackDP otherRouter = (KnapsackDP) otherHost.getRouter();
 
         this.delayTable.addAllAckedMessageIds(otherRouter.delayTable.getAllAckedMessageIds());
         otherRouter.delayTable.addAllAckedMessageIds(this.delayTable.getAllAckedMessageIds());
@@ -434,7 +472,7 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
             double time = SimClock.getTime();
             double delay = estimateDelay(m, host, true);
             updateDelayTableEntry(m, host, delay, time);
-            ((EstimateKnapsackBusTJRouter_Copy) from.getRouter()).updateDelayTableEntry(m, host, delay, time);
+            ((KnapsackDP) from.getRouter()).updateDelayTableEntry(m, host, delay, time);
         }
 
         return stat;
@@ -450,7 +488,7 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
      * @return the current MU value
      */
     private double getMarginalUtility(Message msg, DTNHost otherHost, DTNHost host) {
-        final EstimateKnapsackBusTJRouter_Copy otherRouter = (EstimateKnapsackBusTJRouter_Copy) (otherHost.getRouter());
+        final KnapsackDP otherRouter = (KnapsackDP) (otherHost.getRouter());
 
         return getMarginalUtility(msg, otherRouter, host);
     }
@@ -464,7 +502,7 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
      * @param host   The host which contains a copy of this message
      * @return the current MU value
      */
-    private double getMarginalUtility(Message msg, EstimateKnapsackBusTJRouter_Copy router, DTNHost host) {
+    private double getMarginalUtility(Message msg, KnapsackDP router, DTNHost host) {
         double marginalUtility = 0.0;
         double utility = 0.0; // U(i): The utility of the message (packet) i
         double utilityOld = 0.0;
@@ -492,7 +530,7 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
         double utility = 0.0; // U(i): The utility of the message (packet) i
         double packetDelay = 0.0; // D(i): The expected delay of message i
 
-        switch (ALGORITHM) {
+        switch (this.algorithm) {
             // minimizing average delay
             // U(i) = -D(i)
             case AVERAGE_DELAY: {
@@ -549,6 +587,18 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
                     }
                 }
                 utility = -packetDelay;
+                break;
+            }
+            case RANDOM: {
+                utility = java.util.concurrent.ThreadLocalRandom.current().nextDouble(0.0, 1.0);
+                break;
+            }
+            case UNIFORM: {
+                utility = 1.0;
+                break;
+            }
+            case PROPHET: {
+                utility = this.getPredFor(msg.getTo());
                 break;
             }
             default:
@@ -617,7 +667,7 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
                 if (host == getHost()) {
                     continue; // skip
                 }
-                transferTime = ((EstimateKnapsackBusTJRouter_Copy) host.getRouter()).computeTransferTime(msg,
+                transferTime = ((KnapsackDP) host.getRouter()).computeTransferTime(msg,
                         msg.getTo()); // MXm(i)
                 // with
                 // m
@@ -728,7 +778,7 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
 
         for (Connection con : getConnections()) {
             DTNHost other = con.getOtherNode(getHost());
-            EstimateKnapsackBusTJRouter_Copy otherRouter = (EstimateKnapsackBusTJRouter_Copy) other.getRouter();
+            KnapsackDP otherRouter = (KnapsackDP) other.getRouter();
             // Memeriksa apakah host tersebut sedang dalam proses mentransfer pesan atau
             // tidak
             if (otherRouter.isTransferring()) {
@@ -811,15 +861,18 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
     }
 
     @Override
-    public EstimateKnapsackBusTJRouter_Copy replicate() {
-        return new EstimateKnapsackBusTJRouter_Copy(this);
+    public KnapsackDP replicate() {
+        return new KnapsackDP(this);
 
     }
 
     private enum UtilityAlgorithm {
         AVERAGE_DELAY,
         MISSED_DEADLINES,
-        MAXIMUM_DELAY;
+        MAXIMUM_DELAY,
+        RANDOM,
+        UNIFORM,
+        PROPHET;
     }
 
     public Map<Integer, DTNHost> getHostMapping() {
@@ -895,11 +948,18 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
     }
 
     public void getUtilityMsgToArrForSend(DTNHost thisHost, DTNHost otherHost) {
+        this.lengthMsg.clear();
+        this.utilityMsg.clear();
         for (Message m : thisHost.getMessageCollection()) {
             this.lengthMsg.add(m.getSize() / bytes); // in kiloBytes
 
-            // Perbaikan nilai utility murni: U(i) = -D(i)
-            this.utilityMsg.add(computeUtility(m, thisHost, true));
+            double util = 0;
+            if (this.algorithm == UtilityAlgorithm.PROPHET) {
+                util = ((KnapsackDP) otherHost.getRouter()).getPredFor(m.getTo());
+            } else {
+                util = computeUtility(m, thisHost, true);
+            }
+            this.utilityMsg.add(util);
         }
     }
 
@@ -917,6 +977,7 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
 
     // Perubahan Terbaru
     public void knapsackSend(DTNHost thisHost, DTNHost otherHost) {
+        this.tempMsg.clear();
         this.tempMsg.addAll(this.getMessageCollection());
         int jumlahMsg = 0;
         int retriction = 0;
@@ -979,5 +1040,76 @@ public class EstimateKnapsackBusTJRouter_Copy extends LinkDurationRouter {
     @Override
     protected boolean makeRoomForMessage(int size) {
         return true; 
+    }
+
+    // --- PROPHET HELPER METHODS ---
+    private void initProphet(Settings s) {
+        if (this.algorithm == UtilityAlgorithm.PROPHET) {
+            Settings prophetSettings = new Settings(PROPHET_NS);
+            secondsInTimeUnit = prophetSettings.getInt(SECONDS_IN_UNIT_S);
+            if (prophetSettings.contains(BETA_S)) {
+                beta = prophetSettings.getDouble(BETA_S);
+            } else {
+                beta = DEFAULT_BETA;
+            }
+            initPreds();
+        }
+    }
+
+    private void initPreds() {
+        this.preds = new HashMap<DTNHost, Double>();
+    }
+
+    public double getPredFor(DTNHost host) {
+        ageDeliveryPreds(); // make sure preds are updated before getting
+        if (preds.containsKey(host)) {
+            return preds.get(host);
+        } else {
+            return 0.0;
+        }
+    }
+
+    private void updateDeliveryPredFor(DTNHost host) {
+        double oldValue = getPredFor(host);
+        double newValue = oldValue + (1 - oldValue) * P_INIT;
+        preds.put(host, newValue);
+    }
+
+    private void updateTransitivePreds(DTNHost host) {
+        MessageRouter otherRouter = host.getRouter();
+        assert otherRouter instanceof KnapsackDP : "PROPHET mode only works with other KnapsackDP routers";
+        
+        double pForHost = getPredFor(host); // P(a,b)
+        Map<DTNHost, Double> othersPreds = ((KnapsackDP) otherRouter).getDeliveryPreds();
+        
+        for (Map.Entry<DTNHost, Double> e : othersPreds.entrySet()) {
+            if (e.getKey() == getHost()) {
+                continue; // don't add yourself
+            }
+            
+            double pOld = getPredFor(e.getKey()); // P(a,c)_old
+            double pNew = pOld + (1 - pOld) * pForHost * e.getValue() * beta;
+            preds.put(e.getKey(), pNew);
+        }
+    }
+
+    private void ageDeliveryPreds() {
+        if (secondsInTimeUnit == 0) return; // Guard to avoid division by zero
+        double timeDiff = (SimClock.getTime() - this.lastAgeUpdate) / secondsInTimeUnit;
+        if (timeDiff == 0) {
+            return;
+        }
+        
+        double mult = Math.pow(GAMMA, timeDiff);
+        for (Map.Entry<DTNHost, Double> e : preds.entrySet()) {
+            e.setValue(e.getValue() * mult);
+        }
+        
+        this.lastAgeUpdate = SimClock.getTime();
+    }
+
+    private Map<DTNHost, Double> getDeliveryPreds() {
+        ageDeliveryPreds(); // make sure the aging is done
+        return this.preds;
     }
 }
